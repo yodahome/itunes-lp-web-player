@@ -1,0 +1,18 @@
+# Generated backups & overview page
+*.bak
+index.html
+_local_audio/
+_local_media/
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
