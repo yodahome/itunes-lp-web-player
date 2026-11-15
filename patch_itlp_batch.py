@@ -53,6 +53,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "info_rebuild": "    [Info] Vorhandener Patch erkannt -> baue sauber auf index.html.orig.bak neu auf.",
         "warn_no_orig": "    [Warnung] Kein Ur-Backup vorhanden -> bereinige vorhandenen Patch-Block.",
         "warn_manifest": "    [Warnung] manifest.xml Parse-Fehler: {err}",
+        "js_const_fixed": "    [JS-Fix] Globale const/var-Kollision behoben in: {filename}",
         "cover_extracted": "    [Cover] Eingebettetes M4A-Artwork extrahiert -> {filename}",
         "done_single": "  [Fertig] index.html erfolgreich gepatcht.",
         "bak_root_saved": "\n[Backup] Vorhandene Stamm-index.html gesichert: {dst}",
@@ -86,6 +87,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "info_rebuild": "    [Info] Existing patch detected -> rebuilding cleanly from index.html.orig.bak.",
         "warn_no_orig": "    [Warning] No original backup found -> stripping existing patch block.",
         "warn_manifest": "    [Warning] manifest.xml parse error: {err}",
+        "js_const_fixed": "    [JS-Fix] Resolved global const/var collision in: {filename}",
         "cover_extracted": "    [Cover] Extracted embedded M4A artwork -> {filename}",
         "done_single": "  [Done] index.html patched successfully.",
         "bak_root_saved": "\n[Backup] Saved existing root index.html: {dst}",
@@ -135,6 +137,40 @@ def normalize(text: str) -> str:
     text = re.sub(r"\(\d{4}\s*-?\s*remaster(?:ed)?\)", "", text)
     text = re.sub(r"[^a-z0-9äöüß]+", "", text)
     return text
+
+
+def fix_js_const_collisions(itlp_dir: Path) -> None:
+    """
+    Converts legacy WebKit `const` declarations in LP scripts (including TuneKit.js)
+    to `var` so redeclarations like `var SOUND_EXIT` in songs.js/videos.js do not
+    throw a fatal SyntaxError in modern browsers.
+    """
+    for js_file in itlp_dir.rglob("*.js"):
+        if any(part in ("_local_audio", "_local_media") for part in js_file.parts):
+            continue
+        if js_file.name.lower() in ("framework.js", "prettify.js", "jquery.js"):
+            continue
+        if js_file.name.endswith(".bak"):
+            continue
+
+        orig_bak = js_file.with_name(js_file.name + ".orig.bak")
+        base_text = (
+            orig_bak.read_text(encoding="utf-8", errors="ignore")
+            if orig_bak.exists()
+            else js_file.read_text(encoding="utf-8", errors="ignore")
+        )
+
+        new_text, count = re.subn(
+            r"(^|[;{}\n\r\t ])const(\s+[A-Za-z_$][\w$]*)",
+            r"\1var\2",
+            base_text,
+            flags=re.MULTILINE,
+        )
+        if count > 0:
+            if not orig_bak.exists():
+                shutil.copy2(js_file, orig_bak)
+            js_file.write_text(new_text, encoding="utf-8")
+            print(tr("js_const_fixed", filename=js_file.relative_to(itlp_dir).as_posix()))
 
 
 def _scan_mp4_atoms(data: bytes, start: int, end: int) -> tuple[bytes, str] | None:
@@ -228,6 +264,8 @@ def extract_metadata_and_media(itlp_dir: Path) -> tuple[dict, list[dict], list[d
 
     for js_file in itlp_dir.rglob("*.js"):
         if "_local_audio" in js_file.parts or "_local_media" in js_file.parts:
+            continue
+        if js_file.name.endswith(".bak"):
             continue
         raw = js_file.read_text(encoding="utf-8", errors="ignore")
 
@@ -466,7 +504,6 @@ def prepare_clean_html_source(itlp_dir: Path, index_html: Path) -> str:
 
 
 def build_shim_script(xid_entries: list[dict], video_entries: list[dict], home_href: str) -> str:
-    """Builds the injected CSS/JS shim (floating player bar, video lightbox, iTunes API bridge)."""
     entries_json = json.dumps(xid_entries, indent=2, ensure_ascii=False)
     videos_json = json.dumps(video_entries, indent=2, ensure_ascii=False)
     home_json = json.dumps(home_href)
@@ -629,11 +666,25 @@ def build_shim_script(xid_entries: list[dict], video_entries: list[dict], home_h
 
 <script id="itlp-local-audio-shim">
 (function() {{
+  // Legacy WebKit compatibility: old iTunes LPs (e.g., Let It Be... Naked) call
+  // setTimeout() or setInterval() with 0 arguments to initialize timer variables.
+  const _origSetTimeout = window.setTimeout.bind(window);
+  window.setTimeout = function(fn, delay, ...args) {{
+    if (typeof fn !== "function" && typeof fn !== "string") return 0;
+    return _origSetTimeout(fn, delay || 0, ...args);
+  }};
+
+  const _origSetInterval = window.setInterval.bind(window);
+  window.setInterval = function(fn, delay, ...args) {{
+    if (typeof fn !== "function" && typeof fn !== "string") return 0;
+    return _origSetInterval(fn, delay || 0, ...args);
+  }};
+
   const TRACKS = {entries_json};
   const VIDEOS = {videos_json};
   const HOME_HREF = {home_json};
 
-  const IS_DE = /^de\b/i.test(navigator.language || "");
+  const IS_DE = /^de\\b/i.test(navigator.language || "");
   const UI = IS_DE ? {{
     ready: "Bereit",
     bonusVideo: "Bonus-Video",
@@ -1139,58 +1190,6 @@ def build_shim_script(xid_entries: list[dict], video_entries: list[dict], home_h
 
   window.iTunes = Object.assign(window.iTunes || {{}}, iTunesApi);
 
-  function getActiveNavigationView() {{
-    const views = Array.from(document.querySelectorAll("#navigation > div"));
-    const visible = views.filter(el => {{
-      const cs = window.getComputedStyle(el);
-      return cs.display !== "none" && cs.visibility !== "hidden" && !el.classList.contains("tk-inactive");
-    }});
-    return visible.map(el => el.id || el.className).join("|");
-  }}
-
-  function navigateToHomeFallback() {{
-    const controllers = [
-      window.bookletController,
-      window.appController,
-      window.navigationController,
-      window.TKNavigationController && window.TKNavigationController.sharedNavigationController
-    ].filter(Boolean);
-
-    for (const ctrl of controllers) {{
-      if (typeof ctrl.navigateTo === "function") {{
-        try {{ ctrl.navigateTo("home"); return true; }} catch (_) {{}}
-      }}
-      if (typeof ctrl.popView === "function") {{
-        try {{ ctrl.popView(); return true; }} catch (_) {{}}
-      }}
-      if (typeof ctrl.popToRootView === "function") {{
-        try {{ ctrl.popToRootView(); return true; }} catch (_) {{}}
-      }}
-    }}
-
-    const homeView = document.querySelector("#navigation > #home, #home");
-    if (homeView) {{
-      document.querySelectorAll("#navigation > div").forEach(v => {{
-        if (v !== homeView) {{
-          v.classList.add("tk-inactive");
-          v.style.display = "none";
-        }}
-      }});
-      homeView.classList.remove("tk-inactive");
-      homeView.style.display = "block";
-      homeView.style.visibility = "visible";
-      homeView.style.opacity = "1";
-      const menuEl = homeView.querySelector("#menu");
-      if (menuEl) {{
-        menuEl.classList.remove("tk-inactive");
-        menuEl.style.visibility = "visible";
-        menuEl.style.opacity = "1";
-      }}
-      return true;
-    }}
-    return false;
-  }}
-
   function hookBookletController() {{
     if (typeof window.bookletController === "undefined" || window.bookletController._shimmed) {{
       return;
@@ -1227,63 +1226,11 @@ def build_shim_script(xid_entries: list[dict], video_entries: list[dict], home_h
     }};
   }}
 
+  // Individual video tiles inside videos.html (`#video01`..`#video10`) fallback if XID lookup misses
   document.addEventListener("click", (e) => {{
     const target = e.target;
     if (!target || target.closest("#itlp-floating-bar") || target.closest("#itlp-video-overlay")) return;
 
-    // 1. Subpage Home / Back button (`.home`, `#home .image-fader`, `.back`)
-    const homeBtn = target.closest(".home, #home .image-fader, .back");
-    if (homeBtn && !homeBtn.closest("#menu")) {{
-      const beforeView = getActiveNavigationView();
-      setTimeout(() => {{
-        const afterView = getActiveNavigationView();
-        if (afterView === beforeView) {{
-          navigateToHomeFallback();
-        }}
-      }}, 220);
-      return;
-    }}
-
-    // 2. Main menu Videos button (`.btn_videos`) -> Open videos view first, fallback to player if view missing
-    const videosMenuBtn = target.closest(".btn_videos");
-    if (videosMenuBtn) {{
-      const beforeView = getActiveNavigationView();
-      setTimeout(() => {{
-        const afterView = getActiveNavigationView();
-        const overlayOpen = document.getElementById("itlp-video-overlay")?.classList.contains("open");
-        if (!overlayOpen && afterView === beforeView) {{
-          if (window.bookletController && typeof window.bookletController.navigateTo === "function") {{
-            try {{ window.bookletController.navigateTo("videos"); }} catch (_) {{}}
-          }}
-          const videosView = document.querySelector("#navigation > #videos, #videos");
-          if (videosView) {{
-            const homeView = document.querySelector("#navigation > #home, #home");
-            if (homeView) {{
-              homeView.classList.add("tk-inactive");
-              homeView.style.display = "none";
-            }}
-            videosView.classList.remove("tk-inactive");
-            videosView.style.display = "block";
-            videosView.style.visibility = "visible";
-            videosView.style.opacity = "1";
-          }} else if (VIDEOS.length > 0) {{
-            openVideoOverlay(VIDEOS[0]);
-          }}
-        }}
-      }}, 220);
-      return;
-    }}
-
-    // 3. Play All / Audio play triggers (.play_all, .btn_anhoeren, or general play actions)
-    const playTrigger = target.closest(".play_all, .btn_anhoeren, #play_all");
-    if (playTrigger) {{
-      if (TRACKS.length > 0) {{
-        playTrackObj(TRACKS[0], TRACKS);
-      }}
-      return;
-    }}
-
-    // 4. Individual video buttons inside videos.html (`#video01` .. `#video10` or `.video-button`)
     const videoItemBtn = target.closest(".video-button, [id^='video0'], [id^='video1']");
     if (videoItemBtn && VIDEOS.length > 0) {{
       const vidId = videoItemBtn.id || "";
@@ -1310,6 +1257,7 @@ def build_shim_script(xid_entries: list[dict], video_entries: list[dict], home_h
 </script>
 """
 
+
 def link_or_copy_file(src: Path, target: Path, copy_files: bool) -> None:
     if target.exists():
         return
@@ -1329,6 +1277,8 @@ def process_single_itlp(itlp_dir: Path, root_dir: Path, copy_files: bool) -> dic
     if not index_html.exists():
         print(tr("skip_no_index"))
         return None
+
+    fix_js_const_collisions(itlp_dir)
 
     album_dir = itlp_dir.parent
     meta, tracks, videos = extract_metadata_and_media(itlp_dir)
@@ -1653,7 +1603,7 @@ def generate_root_index(root_dir: Path, albums: list[dict]) -> None:
   </main>
   <script>
     (function() {{
-      const isDe = /^de\b/i.test(navigator.language || "");
+      const isDe = /^de\\b/i.test(navigator.language || "");
       const albumCount = {count};
       if (isDe) {{
         document.documentElement.lang = "de";
