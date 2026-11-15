@@ -2,6 +2,10 @@
 
 A zero-dependency Python batch patcher and local HTTP range server that brings archived **Apple iTunes LP (`.itlp`)** interactive albums back to life in modern web browsers—complete with audio playback, fullscreen bonus videos, embedded cover art extraction, and a searchable collection overview.
 
+**Please note:** The scripts are mostly generated using Google Gemini through analysing the original iTunes LP files. They qualify as vibe coded.
+
+I have tested this with 22 releases that I own, including Yellow Submarine by The Beatles (2009 re-release), Fearless by Taylor Swift, auch by Die Ärzte or Goodbye Lullaby by Avril Lavigne. So far I still have issues correctly playing Kraniche bei Bosse. But it mostly works ;-)
+
 When Apple discontinued iTunes, `.itlp` packages lost their native JavaScript bridge (`window.iTunes` and `TuneKit`), leaving menus, lyrics, and bonus features silent in regular browsers. This tool injects a lightweight compatibility shim into each `.itlp` bundle and links it to your local audio and video files.
 
 ---
